@@ -12,6 +12,7 @@ Electricity fraud has resulted in significant financial losses for the company, 
 
 Please refer to the Python notebook for a detailed walkthrough of our workflow.
 
+More information about the challenge can be found here: https://zindi.africa/competitions/fraud-detection-in-electricity-and-gas-consumption-challenge
 
 ## Set up your Environment
 
