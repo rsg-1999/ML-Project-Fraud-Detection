@@ -74,24 +74,46 @@ Or ....
 
 
    
-## Usage
+## Databricks pipeline (Free Edition)
 
-In order to train the model and store test data in the data folder and the model in models run:
+Everything lives in [`fraud_pipeline/`](fraud_pipeline). The notebooks are thin; the logic is in
+`settings.py` (all knobs), `lakehouse.py` (bronze/silver/gold) and `modeling.py` (train, registry, monitoring).
 
-**`Note`**: Make sure your environment is activated.
-
-```bash
-python example_files/train.py  
+```
+source CSVs ──01──> landing/ (initial + 3 arrival batches + score feed)
+                      │ 02
+                      ▼
+              bronze (raw as-is, Delta) ─03─> silver (typed, deduped) ─> gold (1 row/client + split)
+                                                                             │ 04
+              MLflow experiment <── runs, metrics ── train / val / frozen test ┘
+              Unity Catalog model: aliases `challenger` / `champion`
+                      │ 05                         │ 06 (per labeled batch)
+          score unlabeled test data         score batch with champion, check drift + PR-AUC,
+          (label-free monitoring)           retrain if triggered, promote only if it beats champion
 ```
 
-In order to test that predict works on a test set you created run:
+**Splits.** Labeled clients are hashed into buckets: 60% train, 15% val, 10% frozen test, and 15% held back as three
+arrival batches. The frozen test is never used for fitting or tuning, so every model version is comparable on it.
+Retraining uses train + the batches that have arrived; val picks the config and threshold.
+`data/test/` has no labels, so it is only scored (05) for monitoring.
 
+**Run it**
+1. Add this repo as a Git folder in your workspace (or import the `fraud_pipeline` folder).
+2. Run `00_setup`, then upload the four CSVs from `data/` to the volume path it prints.
+3. Run `01` → `02` → `03` → `04` → `05` in order (serverless compute).
+4. Run `06_process_new_batch` for `batch_1`, then `batch_2` (drifted on purpose, should trigger a retrain), then `batch_3`.
+5. Watch the experiment in the MLflow UI: compare `check_*` runs, `score_*` runs and the registered model versions.
+
+`batch_1`/`batch_3` come from the same distribution, so they usually won't trigger a retrain. The drift in `batch_2`
+is injected by `01` (`DRIFT_BATCH`, `DRIFT_FACTOR` in `settings.py`).
+
+**Local check** (synthetic data, local Spark + MLflow, no Databricks needed):
 ```bash
-python example_files/predict.py models/linear_regression_model.sav data/X_test.csv data/y_test.csv
+pytest tests/test_smoke.py -s
 ```
 
-## Limitations
+## Notebook
 
-Development libraries are part of the production environment, normally these would be separate as the production code should be as slim as possible.
-
-
+[`Fraud_Detection_workflow.ipynb`](Fraud_Detection_workflow.ipynb) is the original exploratory analysis. The pipeline
+fixes some issues it has: SMOTE inside cross-validation instead of before it, thresholds chosen on a validation set
+instead of the test set, ROC AUC computed from probabilities, and imputation fitted on train only.

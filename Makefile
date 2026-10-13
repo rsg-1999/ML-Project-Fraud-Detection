@@ -14,8 +14,8 @@ setup:
 	@echo "=========|| The pyenv has successfully curated Python version $(PYTHON_VERSION) locally ||========="
 	python -m venv .venv 
 	@echo "=========|| The environment has been curated successfully ||========="
-	pip install --upgrade pip 
+	.venv/bin/pip install --upgrade pip
 	@echo "=========|| The pipe has been updated successfully ||========="
-	pip install -r requirements.txt 
+	.venv/bin/pip install -r requirements.txt
 	@echo "=========|| The requirements have been installed successfully ||========="
 
