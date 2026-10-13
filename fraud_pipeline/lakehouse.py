@@ -28,39 +28,76 @@ def _write_raw(df, path):
     df.write.mode("overwrite").option("header", True).csv(path)
 
 
-def _drift(inv):
+def _drift(clients, inv):
+    """Covariate drift: scale readings. Concept drift: the top DRIFT_NEW_FRAUD consumers become fraud too."""
     f = S.DRIFT_FACTOR
     for c in S.CONS:
         inv = inv.withColumn(c, (F.col(c).cast("double") * f).cast("long").cast("string"))
     o, n = F.col("old_index").cast("double"), F.col("new_index").cast("double")
-    return inv.withColumn("new_index", (o + f * (n - o)).cast("long").cast("string"))
+    inv = inv.withColumn("new_index", (o + f * (n - o)).cast("long").cast("string"))
+    use = inv.groupBy("client_id").agg(F.avg(F.col("consommation_level_1").cast("double")).alias("use"))
+    rank = use.withColumn("r", F.percent_rank().over(Window.orderBy(F.col("use").desc())))
+    new_fraud = rank.filter(F.col("r") < S.DRIFT_NEW_FRAUD).select("client_id", F.lit(True).alias("_new"))
+    clients = (clients.join(new_fraud, "client_id", "left")
+               .withColumn("target", F.when(F.col("_new"), F.lit("1.0")).otherwise(F.col("target"))).drop("_new"))
+    return clients, inv
 
 
 def simulate_arrivals():
     """Split the labeled source files into `initial` + arrival batches (by client bucket) and
     copy the unlabeled test files to the `score` feed. Raw values are written back untouched,
-    except in S.DRIFT_BATCH where invoice readings are scaled on purpose."""
+    except in S.DRIFT_BATCHES (see _drift)."""
     src = f"{S.ROOT}/source"
     clients, inv = _read_raw(f"{src}/client_train.csv"), _read_raw(f"{src}/invoice_train.csv")
     for name, (lo, hi) in S.LANDING.items():
-        i = inv.filter(_in(lo, hi))
-        _write_raw(clients.filter(_in(lo, hi)), f"{S.ROOT}/landing/labeled/{name}/client")
-        _write_raw(_drift(i) if name == S.DRIFT_BATCH else i, f"{S.ROOT}/landing/labeled/{name}/invoice")
+        c, i = clients.filter(_in(lo, hi)), inv.filter(_in(lo, hi))
+        if name in S.DRIFT_BATCHES:
+            c, i = _drift(c, i)
+        _write_raw(c, f"{S.ROOT}/landing/labeled/{name}/client")
+        _write_raw(i, f"{S.ROOT}/landing/labeled/{name}/invoice")
     for entity in ("client", "invoice"):
         _write_raw(_read_raw(f"{src}/{entity}_test.csv"), f"{S.ROOT}/landing/score/initial/{entity}")
 
 
 # ---- bronze: raw as-is + ingest metadata, append-only, safe to rerun ----
-def ingest_bronze(feed, batch):
+def _stamp(df):
+    return df.select("*", F.current_timestamp().alias("_ingest_ts"), F.col("_metadata.file_path").alias("_source_file"))
+
+
+def _autoload(path, table, ckpt):
+    """Auto Loader remembers which files it has seen in the checkpoint, so each file is loaded exactly once.
+    Delete the checkpoint folder if you drop the table, otherwise nothing is reloaded."""
+    (_stamp(spark().readStream.format("cloudFiles").option("cloudFiles.format", "csv").option("header", True)
+            .option("cloudFiles.schemaLocation", ckpt).load(path))  # no type inference: strings as-is
+     .writeStream.option("checkpointLocation", ckpt).option("mergeSchema", True)
+     .trigger(availableNow=True).toTable(table).awaitTermination())
+
+
+def _append_new_files(path, table):
+    """Plain-Spark fallback (local test): skip files already present in the table."""
     sp = spark()
+    df = _stamp(_read_raw(path))
+    if sp.catalog.tableExists(table):
+        done = [r[0] for r in sp.table(table).select("_source_file").distinct().collect()]
+        df = df.filter(~F.col("_source_file").isin(done))
+    df.write.mode("append").option("mergeSchema", True).saveAsTable(table)
+
+
+def ingest_bronze(feed, batch):
     for entity in ("client", "invoice"):
-        table = t(f"bronze_{feed}_{entity}")
-        df = _read_raw(f"{S.ROOT}/landing/{feed}/{batch}/{entity}").select(
-            "*", F.current_timestamp().alias("_ingest_ts"), F.col("_metadata.file_path").alias("_source_file"))
-        if sp.catalog.tableExists(table):  # skip files already loaded
-            done = [r[0] for r in sp.table(table).select("_source_file").distinct().collect()]
-            df = df.filter(~F.col("_source_file").isin(done))
-        df.write.mode("append").option("mergeSchema", True).saveAsTable(table)
+        path, table = f"{S.ROOT}/landing/{feed}/{batch}/{entity}", t(f"bronze_{feed}_{entity}")
+        if S.AUTOLOADER:
+            _autoload(path, table, f"{S.ROOT}/_checkpoints/{feed}_{batch}_{entity}")
+        else:
+            _append_new_files(path, table)
+
+
+def next_batch():
+    """First arrival batch whose files are not in bronze yet, or None when everything has arrived."""
+    sp = spark()
+    table = t("bronze_labeled_client")
+    loaded = [r[0] for r in sp.table(table).select("_source_file").distinct().collect()] if sp.catalog.tableExists(table) else []
+    return next((b for b in S.BATCHES if not any(f"/landing/labeled/{b}/" in f for f in loaded)), None)
 
 
 # ---- silver: typed + deduplicated ----
@@ -115,6 +152,8 @@ def build_gold(feed):
             split = F.when(_in(lo, hi), name).otherwise(split)
     else:
         split = F.lit("score")
+    recent = F.expr("pmod(xxhash64(client_id, 'recent'), 100)") < int(S.RECENT_SHARE * 100)
     g = g.select("client_id", "target", split.alias("split"),
+                 (split.startswith("batch_") & recent).alias("recent_eval"),
                  *[F.col(c).cast("string") for c in S.CAT], *[F.col(c).cast("double") for c in S.NUM])
     g.write.mode("overwrite").saveAsTable(t(f"gold_{feed}"))

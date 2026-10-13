@@ -1,0 +1,62 @@
+# Jobs as code. Needs the Databricks CLI:  databricks auth login --host <workspace url>
+#   databricks bundle validate && databricks bundle deploy
+# Both jobs run the notebooks straight from the Git branch below (serverless compute).
+bundle:
+  name: fraud_detection
+
+variables:
+  branch:
+    default: databricks_learn
+
+sync:
+  exclude: ["**"]  # nothing to upload, the jobs read from Git
+
+targets:
+  dev:
+    default: true
+    workspace:
+      host: https://dbc-5c2e98ef-3c85.cloud.databricks.com
+
+resources:
+  jobs:
+    fraud_initial_load:  # run once: 01 -> 05
+      name: fraud_initial_load
+      git_source:
+        git_url: https://github.com/rsg-1999/ML-Project-Fraud-Detection.git
+        git_provider: gitHub
+        git_branch: ${var.branch}
+      tasks:
+        - task_key: simulate_arrivals
+          notebook_task: {notebook_path: fraud_pipeline/01_simulate_arrivals, source: GIT}
+        - task_key: ingest_bronze
+          depends_on: [{task_key: simulate_arrivals}]
+          notebook_task: {notebook_path: fraud_pipeline/02_ingest_bronze, source: GIT}
+        - task_key: build_silver_gold
+          depends_on: [{task_key: ingest_bronze}]
+          notebook_task: {notebook_path: fraud_pipeline/03_build_silver_gold, source: GIT}
+        - task_key: train_register
+          depends_on: [{task_key: build_silver_gold}]
+          notebook_task: {notebook_path: fraud_pipeline/04_train_register, source: GIT}
+        - task_key: score_unlabeled
+          depends_on: [{task_key: train_register}]
+          notebook_task: {notebook_path: fraud_pipeline/05_score_unlabeled, source: GIT}
+
+    fraud_next_batch:  # each run ingests the next arrival batch, checks/retrains, then scores the unlabeled data
+      name: fraud_next_batch
+      schedule:
+        quartz_cron_expression: "0 0 6 * * ?"
+        timezone_id: UTC
+        pause_status: PAUSED  # unpause in the UI when you want it to run daily
+      git_source:
+        git_url: https://github.com/rsg-1999/ML-Project-Fraud-Detection.git
+        git_provider: gitHub
+        git_branch: ${var.branch}
+      tasks:
+        - task_key: process_batch
+          notebook_task:
+            notebook_path: fraud_pipeline/06_process_new_batch
+            source: GIT
+            base_parameters: {batch: next}
+        - task_key: score_unlabeled
+          depends_on: [{task_key: process_batch}]
+          notebook_task: {notebook_path: fraud_pipeline/05_score_unlabeled, source: GIT}

@@ -28,9 +28,13 @@ def setup_mlflow():
 
 
 # ---- data ----
-def load(splits, feed="labeled"):
-    """Gold rows in `splits` -> (X, y, client_ids). Gold already has typed columns (CAT=string, NUM=double)."""
-    df = lakehouse.spark().table(lakehouse.t(f"gold_{feed}")).filter(F.col("split").isin(list(splits))).toPandas()
+def load(splits, feed="labeled", recent=None):
+    """Gold rows in `splits` -> (X, y, client_ids). Gold already has typed columns (CAT=string, NUM=double).
+    recent=True/False keeps only the held-out / training part of arrival batches."""
+    df = lakehouse.spark().table(lakehouse.t(f"gold_{feed}")).filter(F.col("split").isin(list(splits)))
+    if recent is not None:
+        df = df.filter(F.col("recent_eval") == recent)
+    df = df.toPandas()
     X = df[S.CAT + S.NUM].copy()
     X[S.CAT] = X[S.CAT].fillna("missing")
     return X, df["target"], df["client_id"]
@@ -92,16 +96,28 @@ def monitor(X, scores, thr, base):
 
 
 # ---- train + register ----
+def _champion_or_none():
+    try:
+        return MlflowClient().get_model_version_by_alias(S.MODEL_NAME, "champion")
+    except MlflowException:
+        return None
+
+
 def train_and_register(batches=()):
-    """Fit every config on train(+arrived batches), pick the best on val, score it on the frozen test,
-    register it as `challenger` and promote it to `champion` if it beats the current champion."""
-    Xtr, ytr, _ = load(["train", *batches])
+    """Fit every config on train (+ the training part of arrived batches), pick the best on val and score it on the
+    frozen test and on `recent` (the held-out part of the arrived batches). Register it as `challenger`;
+    it becomes `champion` if it passes the gate described in settings.py."""
+    Xtr, ytr, _ = load(["train"])
+    if batches:
+        Xb, yb, _ = load(batches, recent=False)
+        Xtr, ytr = pd.concat([Xtr, Xb], ignore_index=True), pd.concat([ytr, yb], ignore_index=True)
     Xva, yva, _ = load(["val"])
     Xte, yte, _ = load(["test"])
+    Xrec, yrec, _ = load(batches, recent=True) if batches else (None, None, None)
     pos_weight = float((ytr == 0).sum() / (ytr == 1).sum())
     client = MlflowClient()
 
-    with mlflow.start_run(run_name=f"train_{len(batches)}_batches") as run:
+    with mlflow.start_run(run_name=f"train_{len(batches)}_batches"):
         best = None
         for cfg in S.CONFIGS:
             with mlflow.start_run(run_name=cfg["name"], nested=True):
@@ -116,9 +132,25 @@ def train_and_register(batches=()):
 
         pipe, thr = best["pipe"], best["thr"]
         m_test = metrics(yte, pipe.predict_proba(Xte)[:, 1], thr, "test")  # frozen split: reporting only
+        logged = best["m"] | m_test
+        champ = _champion_or_none()
+        if champ is None:
+            promoted = True
+        else:
+            champ_model = mlflow.sklearn.load_model(f"models:/{S.MODEL_NAME}@champion")
+            champ_test = average_precision_score(yte, champ_model.predict_proba(Xte)[:, 1])
+            if batches:
+                new_rec = average_precision_score(yrec, pipe.predict_proba(Xrec)[:, 1])
+                champ_rec = average_precision_score(yrec, champ_model.predict_proba(Xrec)[:, 1])
+                logged |= {"recent_pr_auc": new_rec, "champion_recent_pr_auc": champ_rec, "n_recent": len(Xrec)}
+                promoted = (new_rec >= champ_rec + S.MIN_GAIN
+                            and m_test["test_pr_auc"] >= champ_test - S.MAX_TEST_REGRESSION)
+            else:
+                promoted = m_test["test_pr_auc"] >= champ_test + S.MIN_GAIN
+            logged["champion_test_pr_auc"] = champ_test
         mlflow.log_params({"best_config": best["cfg"]["name"], "threshold": thr, "n_train": len(Xtr),
-                           "train_splits": ",".join(["train", *batches])})
-        mlflow.log_metrics(best["m"] | m_test)
+                           "train_splits": ",".join(["train", *batches]), "promoted": promoted})
+        mlflow.log_metrics(logged)
         mlflow.log_dict(psi_baseline(Xtr, best["p_val"]), "baseline.json")
         sample = Xte.head(100)
         mlflow.sklearn.log_model(pipe, name="model", signature=infer_signature(sample, pipe.predict(sample)),
@@ -128,15 +160,10 @@ def train_and_register(batches=()):
     mv = max(client.search_model_versions(f"name='{S.MODEL_NAME}'"), key=lambda v: int(v.version))
     client.set_model_version_tag(S.MODEL_NAME, mv.version, "threshold", str(thr))
     client.set_registered_model_alias(S.MODEL_NAME, "challenger", mv.version)
-    try:
-        champ = client.get_model_version_by_alias(S.MODEL_NAME, "champion")
-        champ_pr = client.get_run(champ.run_id).data.metrics["test_pr_auc"]
-    except MlflowException:
-        champ_pr = None
-    promoted = champ_pr is None or m_test["test_pr_auc"] >= champ_pr + S.MIN_GAIN
     if promoted:
         client.set_registered_model_alias(S.MODEL_NAME, "champion", mv.version)
-    print(f"v{mv.version}: test PR-AUC {m_test['test_pr_auc']:.4f} vs champion {champ_pr} -> promoted={promoted}")
+    print(f"v{mv.version}: " + ", ".join(f"{k} {v:.4f}" for k, v in logged.items()
+          if k in ("test_pr_auc", "champion_test_pr_auc", "recent_pr_auc", "champion_recent_pr_auc")) + f" -> promoted={promoted}")
     return {"version": mv.version, "promoted": promoted, "test_pr_auc": m_test["test_pr_auc"]}
 
 

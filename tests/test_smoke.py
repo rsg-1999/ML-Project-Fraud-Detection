@@ -44,6 +44,7 @@ def env(tmp_path_factory):
 
     tmp = tmp_path_factory.mktemp("fraud")
     S.ROOT, S.CATALOG, S.SCHEMA, S.MODEL_NAME = str(tmp / "vol"), "spark_catalog", "fraud", "fraud_model"
+    S.AUTOLOADER = False  # cloudFiles only exists on Databricks
     os.makedirs(f"{S.ROOT}/source")
     rng = np.random.default_rng(0)
     _fake_source(f"{S.ROOT}/source", 12000, rng, True)
@@ -80,12 +81,17 @@ def test_pipeline(env):
     preds = modeling.score_unlabeled()
     assert len(preds) == 2000 and preds.score.between(0, 1).all()
 
-    modeling.check_batch("batch_1")  # clean batch: may or may not trigger on noise
-    out = modeling.check_batch("batch_2")  # drifted batch must trigger a retrain
-    assert out is not None and out["version"] != first["version"]
+    assert lakehouse.next_batch() == "batch_1"
+    results = {}
+    while (b := lakehouse.next_batch()):  # what the scheduled job does on each run
+        results[b] = modeling.check_batch(b)
+    assert lakehouse.next_batch() is None
+    assert results["batch_2"] is not None and results["batch_2"]["version"] != first["version"]  # drift -> retrain
     runs = MlflowClient().search_runs([mlflow_exp_id()], "tags.run_type = 'batch_check'")
     flags = {r.data.tags["batch"]: r.data.tags["retrain_triggered"] for r in runs}
     assert flags["batch_2"] == "True", flags
+    gold = sp.table(lakehouse.t("gold_labeled"))
+    assert gold.filter("recent_eval").count() > 0 and gold.filter("split in ('train','val','test') and recent_eval").count() == 0
 
 
 def mlflow_exp_id():

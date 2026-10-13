@@ -11,13 +11,20 @@ SPLITS = {"train": (0, 60), "val": (60, 75), "test": (75, 85),
 BATCHES = ["batch_1", "batch_2", "batch_3"]
 LANDING = {"initial": (0, 85), **{b: SPLITS[b] for b in BATCHES}}  # what 01_simulate_arrivals writes
 
-# simulated drift: this batch gets its consumption / index readings multiplied
-DRIFT_BATCH, DRIFT_FACTOR = "batch_2", 3.0
+# simulated drift in these batches: (1) invoice readings are scaled (covariate drift) and
+# (2) a new kind of fraud appears: the DRIFT_NEW_FRAUD highest consumers are relabeled as fraud (concept drift)
+DRIFT_BATCHES, DRIFT_FACTOR, DRIFT_NEW_FRAUD = ["batch_2", "batch_3"], 3.0, 0.05
+
+# ingestion: Auto Loader on Databricks; False falls back to plain Spark (used by the local test)
+AUTOLOADER = True
 
 # retrain triggers (see modeling.check_batch)
 PR_AUC_DROP = 0.25  # relative drop of batch PR-AUC vs the champion's frozen-test PR-AUC
 PSI_MAX = 0.25      # >0.25 on any numeric feature or on the score = significant shift
-MIN_GAIN = 0.0      # challenger must beat champion's frozen-test PR-AUC by at least this
+# A challenger is promoted if it beats the champion on `recent` data (a held-out 30% of every arrived batch)
+# by MIN_GAIN PR-AUC without losing more than MAX_TEST_REGRESSION on the frozen test. Before any batch has
+# arrived there is no recent data, so it must beat the champion's frozen-test PR-AUC by MIN_GAIN.
+MIN_GAIN, MAX_TEST_REGRESSION, RECENT_SHARE = 0.005, 0.02, 0.3
 
 CAT = ["disrict", "client_catg", "region", "tarif_type_mode", "counter_coefficient_mode",
        "counter_type_mode", "reading_remarque_min", "reading_remarque_mode"]

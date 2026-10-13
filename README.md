@@ -93,19 +93,32 @@ source CSVs ──01──> landing/ (initial + 3 arrival batches + score feed)
 ```
 
 **Splits.** Labeled clients are hashed into buckets: 60% train, 15% val, 10% frozen test, and 15% held back as three
-arrival batches. The frozen test is never used for fitting or tuning, so every model version is comparable on it.
-Retraining uses train + the batches that have arrived; val picks the config and threshold.
+arrival batches. The frozen test is never used for fitting or tuning. 30% of every arrived batch is a `recent` holdout
+that no model ever trains on; the rest of the batch is added to the training data when a retrain happens.
 `data/test/` has no labels, so it is only scored (05) for monitoring.
 
-**Run it**
-1. Add this repo as a Git folder in your workspace (or import the `fraud_pipeline` folder).
-2. Run `00_setup`, then upload the four CSVs from `data/` to the volume path it prints.
-3. Run `01` → `02` → `03` → `04` → `05` in order (serverless compute).
-4. Run `06_process_new_batch` for `batch_1`, then `batch_2` (drifted on purpose, should trigger a retrain), then `batch_3`.
-5. Watch the experiment in the MLflow UI: compare `check_*` runs, `score_*` runs and the registered model versions.
+**Drift and retraining.** `batch_2` and `batch_3` are drifted on purpose (01): invoice readings are scaled
+(covariate drift) and the top 5% consumers are also labeled fraud (concept drift). For each arriving batch (06):
+the champion scores it, the check logs PR-AUC and PSI per feature to MLflow, and a retrain happens if PR-AUC fell more
+than 25% or any PSI > 0.25. A retrained model becomes `champion` only if it beats the champion on `recent` data
+by `MIN_GAIN` without losing more than `MAX_TEST_REGRESSION` on the frozen test (all in `settings.py`).
 
-`batch_1`/`batch_3` come from the same distribution, so they usually won't trigger a retrain. The drift in `batch_2`
-is injected by `01` (`DRIFT_BATCH`, `DRIFT_FACTOR` in `settings.py`).
+**Run it**
+1. Add this repo as a Git folder in your workspace.
+2. Run `00_setup`, then upload the four CSVs from `data/` to the volume path it prints.
+3. Run `01` to `05` in order (serverless compute), or deploy the `fraud_initial_load` job.
+4. Run `06_process_new_batch` with `batch = next` three times (or schedule the `fraud_next_batch` job); each run picks the
+   next batch that has not arrived yet.
+5. Watch the experiment in the MLflow UI: `check_*`, `score_*` and `train_*` runs and the registered model versions.
+6. `99_reset` wipes tables, landing data and checkpoints (not the uploaded CSVs) for a clean start.
+
+**Jobs as code.** [`databricks.yml`](databricks.yml) defines both jobs (they run the notebooks from this Git branch):
+```bash
+databricks auth login --host <your workspace url>
+databricks bundle validate && databricks bundle deploy
+```
+Ingestion uses Auto Loader (`settings.AUTOLOADER`); if you drop a bronze table, also delete its folder under
+`_checkpoints/` (or just run `99_reset`).
 
 **Local check** (synthetic data, local Spark + MLflow, no Databricks needed):
 ```bash
