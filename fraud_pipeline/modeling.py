@@ -190,10 +190,7 @@ def score_unlabeled():
 
 
 def check_batch(batch):
-    """New labeled batch: ingest -> tables -> score with champion -> compare -> retrain if triggered."""
-    lakehouse.ingest_bronze("labeled", batch)
-    lakehouse.build_silver("labeled")
-    lakehouse.build_gold("labeled")
+    """New labeled batch (already in gold): score with champion -> compare -> retrain if triggered."""
     mv, model, thr, base = load_champion()
     X, y, _ = load([batch])
     p = model.predict_proba(X)[:, 1]

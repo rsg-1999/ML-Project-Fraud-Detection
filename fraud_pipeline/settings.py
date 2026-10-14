@@ -9,14 +9,12 @@ SEED = 101
 SPLITS = {"train": (0, 60), "val": (60, 75), "test": (75, 85),
           "batch_1": (85, 90), "batch_2": (90, 95), "batch_3": (95, 100)}
 BATCHES = ["batch_1", "batch_2", "batch_3"]
-LANDING = {"initial": (0, 85), **{b: SPLITS[b] for b in BATCHES}}  # what 01_simulate_arrivals writes
+INITIAL = (0, 85)  # buckets that are already in landing/ at the start; the batches wait in pending/
 
 # simulated drift in these batches: (1) invoice readings are scaled (covariate drift) and
 # (2) a new kind of fraud appears: the DRIFT_NEW_FRAUD highest consumers are relabeled as fraud (concept drift)
 DRIFT_BATCHES, DRIFT_FACTOR, DRIFT_NEW_FRAUD = ["batch_2", "batch_3"], 3.0, 0.05
 
-# ingestion: Auto Loader on Databricks; False falls back to plain Spark (used by the local test)
-AUTOLOADER = True
 
 # retrain triggers (see modeling.check_batch)
 PR_AUC_DROP = 0.25  # relative drop of batch PR-AUC vs the champion's frozen-test PR-AUC

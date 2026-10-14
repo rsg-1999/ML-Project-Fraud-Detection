@@ -1,15 +1,8 @@
-# Jobs as code. Needs the Databricks CLI:  databricks auth login --host <workspace url>
-#   databricks bundle validate && databricks bundle deploy
-# Both jobs run the notebooks straight from the Git branch below (serverless compute).
+# Jobs, pipeline and compute settings as code. Deploy from your machine:
+#   databricks bundle validate -p <profile> && databricks bundle deploy -p <profile>
+# The deploy uploads fraud_pipeline/ to your workspace; jobs run those files (no notebooks, plain Python scripts).
 bundle:
   name: fraud_detection
-
-variables:
-  branch:
-    default: databricks_learn
-
-sync:
-  exclude: ["**"]  # nothing to upload, the jobs read from Git
 
 targets:
   dev:
@@ -17,46 +10,93 @@ targets:
     workspace:
       host: https://dbc-5c2e98ef-3c85.cloud.databricks.com
 
-resources:
-  jobs:
-    fraud_initial_load:  # run once: 01 -> 05
-      name: fraud_initial_load
-      git_source:
-        git_url: https://github.com/rsg-1999/ML-Project-Fraud-Detection.git
-        git_provider: gitHub
-        git_branch: ${var.branch}
-      tasks:
-        - task_key: simulate_arrivals
-          notebook_task: {notebook_path: fraud_pipeline/01_simulate_arrivals, source: GIT}
-        - task_key: ingest_bronze
-          depends_on: [{task_key: simulate_arrivals}]
-          notebook_task: {notebook_path: fraud_pipeline/02_ingest_bronze, source: GIT}
-        - task_key: build_silver_gold
-          depends_on: [{task_key: ingest_bronze}]
-          notebook_task: {notebook_path: fraud_pipeline/03_build_silver_gold, source: GIT}
-        - task_key: train_register
-          depends_on: [{task_key: build_silver_gold}]
-          notebook_task: {notebook_path: fraud_pipeline/04_train_register, source: GIT}
-        - task_key: score_unlabeled
-          depends_on: [{task_key: train_register}]
-          notebook_task: {notebook_path: fraud_pipeline/05_score_unlabeled, source: GIT}
+sync:
+  exclude: [tests, "*.ipynb", "*.pptx", data, models]
 
-    fraud_next_batch:  # each run ingests the next arrival batch, checks/retrains, then scores the unlabeled data
+resources:
+  pipelines:
+    fraud_etl:  # bronze -> silver -> gold, Databricks works out the order and shows the graph
+      name: fraud_etl
+      catalog: workspace
+      schema: fraud
+      serverless: true
+      root_path: fraud_pipeline
+      libraries:
+        - file: {path: fraud_pipeline/pipeline_bronze.py}
+        - file: {path: fraud_pipeline/pipeline_silver.py}
+        - file: {path: fraud_pipeline/pipeline_gold.py}
+
+  jobs:
+    fraud_initial_load:  # run once (or after a reset): schema, simulate arrivals, build all tables, first model, first scoring
+      name: fraud_initial_load
+      environments:
+        - environment_key: ml
+          spec:
+            environment_version: "4"
+            dependencies: [xgboost, imbalanced-learn]
+      tasks:
+        - task_key: setup
+          environment_key: ml
+          spark_python_task: {python_file: fraud_pipeline/setup_workspace.py}
+        - task_key: simulate_arrivals
+          depends_on: [{task_key: setup}]
+          environment_key: ml
+          spark_python_task: {python_file: fraud_pipeline/simulate_arrivals.py}
+        - task_key: etl
+          depends_on: [{task_key: simulate_arrivals}]
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.fraud_etl.id}
+            full_refresh: true
+        - task_key: train
+          depends_on: [{task_key: etl}]
+          environment_key: ml
+          spark_python_task: {python_file: fraud_pipeline/train.py}
+        - task_key: score
+          depends_on: [{task_key: train}]
+          environment_key: ml
+          spark_python_task: {python_file: fraud_pipeline/score.py}
+
+    fraud_next_batch:  # each run: next batch arrives -> pipeline picks it up -> check/retrain -> score
       name: fraud_next_batch
       schedule:
         quartz_cron_expression: "0 0 6 * * ?"
         timezone_id: UTC
         pause_status: PAUSED  # unpause in the UI when you want it to run daily
-      git_source:
-        git_url: https://github.com/rsg-1999/ML-Project-Fraud-Detection.git
-        git_provider: gitHub
-        git_branch: ${var.branch}
+      environments:
+        - environment_key: ml
+          spec:
+            environment_version: "4"
+            dependencies: [xgboost, imbalanced-learn]
       tasks:
-        - task_key: process_batch
-          notebook_task:
-            notebook_path: fraud_pipeline/06_process_new_batch
-            source: GIT
-            base_parameters: {batch: next}
-        - task_key: score_unlabeled
-          depends_on: [{task_key: process_batch}]
-          notebook_task: {notebook_path: fraud_pipeline/05_score_unlabeled, source: GIT}
+        - task_key: arrive
+          environment_key: ml
+          spark_python_task: {python_file: fraud_pipeline/arrive_next_batch.py}
+        - task_key: etl
+          depends_on: [{task_key: arrive}]
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.fraud_etl.id}
+        - task_key: check_batch
+          depends_on: [{task_key: etl}]
+          environment_key: ml
+          spark_python_task: {python_file: fraud_pipeline/check_batch.py}
+        - task_key: score
+          depends_on: [{task_key: check_batch}]
+          environment_key: ml
+          spark_python_task: {python_file: fraud_pipeline/score.py}
+
+    fraud_reset:  # destructive: databricks bundle run fraud_reset --params delete_model=yes
+      name: fraud_reset
+      parameters:
+        - name: delete_model
+          default: "no"
+      environments:
+        - environment_key: ml
+          spec:
+            environment_version: "4"
+            dependencies: [xgboost, imbalanced-learn]
+      tasks:
+        - task_key: reset
+          environment_key: ml
+          spark_python_task:
+            python_file: fraud_pipeline/reset.py
+            parameters: ["--delete-model", "{{job.parameters.delete_model}}"]

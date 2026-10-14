@@ -44,7 +44,6 @@ def env(tmp_path_factory):
 
     tmp = tmp_path_factory.mktemp("fraud")
     S.ROOT, S.CATALOG, S.SCHEMA, S.MODEL_NAME = str(tmp / "vol"), "spark_catalog", "fraud", "fraud_model"
-    S.AUTOLOADER = False  # cloudFiles only exists on Databricks
     os.makedirs(f"{S.ROOT}/source")
     rng = np.random.default_rng(0)
     _fake_source(f"{S.ROOT}/source", 12000, rng, True)
@@ -58,19 +57,36 @@ def env(tmp_path_factory):
     return S
 
 
+def build_tables(sp):
+    """What the ETL pipeline does on Databricks (Auto Loader -> bronze -> silver -> gold), recomputed locally."""
+    import lakehouse
+    import transforms as X
+    import settings as S
+
+    for feed in ("labeled", "score"):
+        for entity in ("client", "invoice"):
+            raw = sp.read.option("header", True).csv(f"{S.ROOT}/landing/{feed}/*/{entity}")
+            X.stamp(raw).write.mode("overwrite").saveAsTable(lakehouse.t(f"bronze_{feed}_{entity}"))
+        c = X.silver_client(sp.table(lakehouse.t(f"bronze_{feed}_client")))
+        i = X.silver_invoice(sp.table(lakehouse.t(f"bronze_{feed}_invoice")))
+        assert c.count() == c.select("client_id").distinct().count(), "client_id is not unique"
+        c.write.mode("overwrite").saveAsTable(lakehouse.t(f"silver_{feed}_client"))
+        i.write.mode("overwrite").saveAsTable(lakehouse.t(f"silver_{feed}_invoice"))
+        X.gold(sp.table(lakehouse.t(f"silver_{feed}_client")), sp.table(lakehouse.t(f"silver_{feed}_invoice")),
+               feed).write.mode("overwrite").saveAsTable(lakehouse.t(f"gold_{feed}"))
+
+
 def test_pipeline(env):
+    import os
     import lakehouse, modeling
     from mlflow import MlflowClient
 
     S = env
     lakehouse.simulate_arrivals()
-    for feed in ("labeled", "score"):
-        lakehouse.ingest_bronze(feed, "initial")
-        lakehouse.ingest_bronze(feed, "initial")  # idempotent: second call loads nothing
-        lakehouse.build_silver(feed)
-        lakehouse.build_gold(feed)
+    assert sorted(os.listdir(f"{S.ROOT}/pending/labeled")) == S.BATCHES  # batches wait, only `initial` has arrived
+    assert os.listdir(f"{S.ROOT}/landing/labeled") == ["initial"]
     sp = lakehouse.spark()
-    assert sp.table(lakehouse.t("bronze_labeled_client")).count() == sp.table(lakehouse.t("silver_labeled_client")).count()
+    build_tables(sp)
     assert sp.table(lakehouse.t("bronze_labeled_invoice")).count() > sp.table(lakehouse.t("silver_labeled_invoice")).count()
     splits = {r["split"]: r["n"] for r in sp.table(lakehouse.t("gold_labeled")).groupBy("split").count().withColumnRenamed("count", "n").collect()}
     assert set(splits) == {"train", "val", "test"} and abs(splits["train"] / sum(splits.values()) - 60 / 85) < 0.03, splits
@@ -81,11 +97,15 @@ def test_pipeline(env):
     preds = modeling.score_unlabeled()
     assert len(preds) == 2000 and preds.score.between(0, 1).all()
 
-    assert lakehouse.next_batch() == "batch_1"
+    assert lakehouse.next_unchecked() is None
     results = {}
-    while (b := lakehouse.next_batch()):  # what the scheduled job does on each run
+    while (b := lakehouse.arrive_next_batch()):  # what the scheduled job does on each run
+        build_tables(sp)
+        assert lakehouse.next_unchecked() == b
         results[b] = modeling.check_batch(b)
-    assert lakehouse.next_batch() is None
+        lakehouse.mark_checked(b)
+    assert list(results) == S.BATCHES and lakehouse.next_unchecked() is None
+    assert lakehouse.arrive_next_batch() is None and not os.listdir(f"{S.ROOT}/pending/labeled")
     assert results["batch_2"] is not None and results["batch_2"]["version"] != first["version"]  # drift -> retrain
     runs = MlflowClient().search_runs([mlflow_exp_id()], "tags.run_type = 'batch_check'")
     flags = {r.data.tags["batch"]: r.data.tags["retrain_triggered"] for r in runs}

@@ -1,7 +1,11 @@
-"""Bronze -> silver -> gold tables (PySpark). Notebooks 01-03 and 06 call these."""
+"""Files and bookkeeping around the pipeline: simulating arrivals, moving batches into landing, the arrival log."""
+import os
+import shutil
+
 from pyspark.sql import SparkSession, Window, functions as F
 
 import settings as S
+from transforms import in_bucket
 
 
 def spark():
@@ -10,14 +14,6 @@ def spark():
 
 def t(name):
     return f"{S.CATALOG}.{S.SCHEMA}.{name}"
-
-
-def bucket():
-    return F.expr("pmod(xxhash64(client_id), 100)")
-
-
-def _in(lo, hi):
-    return bucket().between(lo, hi - 1)
 
 
 def _read_raw(path):
@@ -44,116 +40,52 @@ def _drift(clients, inv):
 
 
 def simulate_arrivals():
-    """Split the labeled source files into `initial` + arrival batches (by client bucket) and
-    copy the unlabeled test files to the `score` feed. Raw values are written back untouched,
-    except in S.DRIFT_BATCHES (see _drift)."""
+    """Split the labeled source files by client: the initial buckets go to landing/, each arrival batch waits in
+    pending/. The unlabeled test files go to landing/score. Raw values are written back untouched, except in
+    S.DRIFT_BATCHES (see _drift)."""
     src = f"{S.ROOT}/source"
     clients, inv = _read_raw(f"{src}/client_train.csv"), _read_raw(f"{src}/invoice_train.csv")
-    for name, (lo, hi) in S.LANDING.items():
-        c, i = clients.filter(_in(lo, hi)), inv.filter(_in(lo, hi))
-        if name in S.DRIFT_BATCHES:
+    parts = {"landing/labeled/initial": S.INITIAL, **{f"pending/labeled/{b}": S.SPLITS[b] for b in S.BATCHES}}
+    for folder, (lo, hi) in parts.items():
+        c, i = clients.filter(in_bucket(lo, hi)), inv.filter(in_bucket(lo, hi))
+        if folder.split("/")[-1] in S.DRIFT_BATCHES:
             c, i = _drift(c, i)
-        _write_raw(c, f"{S.ROOT}/landing/labeled/{name}/client")
-        _write_raw(i, f"{S.ROOT}/landing/labeled/{name}/invoice")
+        # same column order in every file: CSV readers that glob several folders match columns by position
+        _write_raw(c.select(clients.columns), f"{S.ROOT}/{folder}/client")
+        _write_raw(i.select(inv.columns), f"{S.ROOT}/{folder}/invoice")
     for entity in ("client", "invoice"):
         _write_raw(_read_raw(f"{src}/{entity}_test.csv"), f"{S.ROOT}/landing/score/initial/{entity}")
 
 
-# ---- bronze: raw as-is + ingest metadata, append-only, safe to rerun ----
-def _stamp(df):
-    return df.select("*", F.current_timestamp().alias("_ingest_ts"), F.col("_metadata.file_path").alias("_source_file"))
+# ---- arrivals: pending/ -> landing/, plus an append-only log of what arrived and what has been checked ----
+def _log(batch, event):
+    (spark().createDataFrame([(batch, event)], "batch string, event string")
+     .withColumn("at", F.current_timestamp()).write.mode("append").saveAsTable(t("batch_log")))
 
 
-def _autoload(path, table, ckpt):
-    """Auto Loader remembers which files it has seen in the checkpoint, so each file is loaded exactly once.
-    Delete the checkpoint folder if you drop the table, otherwise nothing is reloaded."""
-    (_stamp(spark().readStream.format("cloudFiles").option("cloudFiles.format", "csv").option("header", True)
-            .option("cloudFiles.schemaLocation", ckpt).load(path))  # no type inference: strings as-is
-     .writeStream.option("checkpointLocation", ckpt).option("mergeSchema", True)
-     .trigger(availableNow=True).toTable(table).awaitTermination())
+def arrive_next_batch():
+    """Move the next waiting batch into landing/ (this is the 'new files appear' moment). None if nothing waits."""
+    pending = f"{S.ROOT}/pending/labeled"
+    waiting = [b for b in S.BATCHES if os.path.isdir(f"{pending}/{b}")]
+    if not waiting:
+        return None
+    b = waiting[0]
+    shutil.copytree(f"{pending}/{b}", f"{S.ROOT}/landing/labeled/{b}")
+    shutil.rmtree(f"{pending}/{b}")
+    _log(b, "arrived")
+    return b
 
 
-def _append_new_files(path, table):
-    """Plain-Spark fallback (local test): skip files already present in the table."""
+def next_unchecked():
+    """Oldest arrived batch that has not been checked yet, or None."""
     sp = spark()
-    df = _stamp(_read_raw(path))
-    if sp.catalog.tableExists(table):
-        done = [r[0] for r in sp.table(table).select("_source_file").distinct().collect()]
-        df = df.filter(~F.col("_source_file").isin(done))
-    df.write.mode("append").option("mergeSchema", True).saveAsTable(table)
+    if not sp.catalog.tableExists(t("batch_log")):
+        return None
+    log = sp.table(t("batch_log"))
+    checked = {r.batch for r in log.filter("event = 'checked'").collect()}
+    arrived = [r.batch for r in log.filter("event = 'arrived'").orderBy("at").collect()]
+    return next((b for b in arrived if b not in checked), None)
 
 
-def ingest_bronze(feed, batch):
-    for entity in ("client", "invoice"):
-        path, table = f"{S.ROOT}/landing/{feed}/{batch}/{entity}", t(f"bronze_{feed}_{entity}")
-        if S.AUTOLOADER:
-            _autoload(path, table, f"{S.ROOT}/_checkpoints/{feed}_{batch}_{entity}")
-        else:
-            _append_new_files(path, table)
-
-
-def next_batch():
-    """First arrival batch whose files are not in bronze yet, or None when everything has arrived."""
-    sp = spark()
-    table = t("bronze_labeled_client")
-    loaded = [r[0] for r in sp.table(table).select("_source_file").distinct().collect()] if sp.catalog.tableExists(table) else []
-    return next((b for b in S.BATCHES if not any(f"/landing/labeled/{b}/" in f for f in loaded)), None)
-
-
-# ---- silver: typed + deduplicated ----
-def build_silver(feed):
-    sp = spark()
-    c = sp.table(t(f"bronze_{feed}_client"))
-    target = F.col("target").cast("double") if "target" in c.columns else F.lit(None).cast("double")
-    c = c.select("client_id", F.col("disrict").cast("int"), F.col("client_catg").cast("int"),
-                 F.col("region").cast("int"), F.to_date("creation_date", "dd/MM/yyyy").alias("creation_date"),
-                 target.alias("target")).dropDuplicates()
-    assert c.count() == c.select("client_id").distinct().count(), "client_id is not unique"
-    c.write.mode("overwrite").saveAsTable(t(f"silver_{feed}_client"))
-
-    i = sp.table(t(f"bronze_{feed}_invoice"))
-    i = i.select("client_id", F.to_date("invoice_date").alias("invoice_date"),
-                 F.col("tarif_type").cast("int"), F.col("counter_number").cast("long"), "counter_statue",
-                 F.col("counter_code").cast("int"), F.col("reading_remarque").cast("int"),
-                 F.col("counter_coefficient").cast("int"),
-                 *[F.col(x).cast("double") for x in S.CONS + ["old_index", "new_index"]],
-                 F.col("months_number").cast("int"), "counter_type").dropDuplicates()
-    i.write.mode("overwrite").saveAsTable(t(f"silver_{feed}_invoice"))
-
-
-# ---- gold: one row per client, model-ready (stateless features only; imputing/encoding is fit in the model) ----
-def build_gold(feed):
-    sp = spark()
-    client, inv = sp.table(t(f"silver_{feed}_client")), sp.table(t(f"silver_{feed}_invoice"))
-    inv = inv.withColumn("diff_index", F.col("new_index") - F.col("old_index"))
-    w = Window.partitionBy("client_id").orderBy("invoice_date")
-    inv = inv.withColumn("gap", F.datediff("invoice_date", F.lag("invoice_date").over(w)))
-    num_cols = S.CONS + ["diff_index"]
-    agg = inv.groupBy("client_id").agg(
-        F.count("*").alias("bill_count"),
-        F.avg("gap").alias("avg_frequency_of_bills_in_days"),
-        F.mode("tarif_type").alias("tarif_type_mode"),
-        F.mode("counter_coefficient").alias("counter_coefficient_mode"),
-        F.mode("counter_type").alias("counter_type_mode"),
-        F.min("reading_remarque").alias("reading_remarque_min"),
-        F.mode("reading_remarque").alias("reading_remarque_mode"),
-        *[F.avg(c).alias(f"{c}_mean") for c in num_cols],
-        *[F.stddev(c).alias(f"{c}_std") for c in num_cols])
-    g = (client.join(agg, "client_id", "left")
-         .withColumn("creation_day", F.dayofmonth("creation_date"))
-         .withColumn("creation_month", F.month("creation_date"))
-         .withColumn("creation_year", F.year("creation_date"))
-         .withColumn("single_bill_client", (F.col("bill_count") == 1).cast("int")))
-    for c in num_cols:  # std of a single bill is undefined -> 0
-        g = g.withColumn(f"{c}_std", F.coalesce(F.col(f"{c}_std"), F.lit(0.0)))
-    if feed == "labeled":
-        split = F.lit("unassigned")
-        for name, (lo, hi) in reversed(list(S.SPLITS.items())):
-            split = F.when(_in(lo, hi), name).otherwise(split)
-    else:
-        split = F.lit("score")
-    recent = F.expr("pmod(xxhash64(client_id, 'recent'), 100)") < int(S.RECENT_SHARE * 100)
-    g = g.select("client_id", "target", split.alias("split"),
-                 (split.startswith("batch_") & recent).alias("recent_eval"),
-                 *[F.col(c).cast("string") for c in S.CAT], *[F.col(c).cast("double") for c in S.NUM])
-    g.write.mode("overwrite").saveAsTable(t(f"gold_{feed}"))
+def mark_checked(batch):
+    _log(batch, "checked")

@@ -76,21 +76,30 @@ Or ....
    
 ## Databricks pipeline (Free Edition)
 
-Everything lives in [`fraud_pipeline/`](fraud_pipeline). The notebooks are thin; the logic is in
-`settings.py` (all knobs), `lakehouse.py` (bronze/silver/gold) and `modeling.py` (train, registry, monitoring).
+Everything lives in [`fraud_pipeline/`](fraud_pipeline) as plain Python scripts, deployed with the Databricks CLI.
+Shared code: `settings.py` (all knobs), `transforms.py` (bronze/silver/gold logic), `lakehouse.py` (simulation, arrivals),
+`modeling.py` (train, registry, monitoring).
 
 ```
-source CSVs ──01──> landing/ (initial + 3 arrival batches + score feed)
-                      │ 02
-                      ▼
-              bronze (raw as-is, Delta) ─03─> silver (typed, deduped) ─> gold (1 row/client + split)
-                                                                             │ 04
-              MLflow experiment <── runs, metrics ── train / val / frozen test ┘
-              Unity Catalog model: aliases `challenger` / `champion`
-                      │ 05                         │ 06 (per labeled batch)
-          score unlabeled test data         score batch with champion, check drift + PR-AUC,
-          (label-free monitoring)           retrain if triggered, promote only if it beats champion
+data CSVs ─upload─> volume/source ─simulate_arrivals─> landing/ (initial)   pending/ (batch_1..3)
+                                                          │                      │ arrive_next_batch (one per run)
+                                                          ▼                      ▼
+                     ETL pipeline (pipeline_*.py):  landing/ ──Auto Loader──> BRONZE ─> SILVER ─> GOLD
+                                                                                                 │
+        MLflow experiment + UC model (champion / challenger) <── train.py / check_batch.py ─────┘
+                                      score.py: score the unlabeled test data, label-free monitoring
 ```
+
+| Script | Does |
+|---|---|
+| `setup_workspace.py` | creates schema and volume |
+| `simulate_arrivals.py` | splits the labeled CSVs: initial data to `landing/`, three batches wait in `pending/` |
+| `pipeline_bronze/silver/gold.py` | the ETL pipeline: Auto Loader into bronze, typed and de-duplicated silver with data-quality rules, gold features and splits |
+| `train.py` | trains 3 configs, registers the best as `challenger`, `champion` if none exists |
+| `score.py` | scores the unlabeled clients with the champion, logs score/PSI monitoring to MLflow |
+| `arrive_next_batch.py` | moves the next batch from `pending/` to `landing/` and logs it |
+| `check_batch.py` | checks the oldest unchecked batch with the champion, retrains if triggered |
+| `reset.py` | wipes landing/pending/predictions (and the model if asked); keeps the uploaded CSVs |
 
 **Splits.** Labeled clients are hashed into buckets: 60% train, 15% val, 10% frozen test, and 15% held back as three
 arrival batches. The frozen test is never used for fitting or tuning. 30% of every arrived batch is a `recent` holdout
@@ -103,22 +112,17 @@ the champion scores it, the check logs PR-AUC and PSI per feature to MLflow, and
 than 25% or any PSI > 0.25. A retrained model becomes `champion` only if it beats the champion on `recent` data
 by `MIN_GAIN` without losing more than `MAX_TEST_REGRESSION` on the frozen test (all in `settings.py`).
 
-**Run it**
-1. Add this repo as a Git folder in your workspace.
-2. Run `00_setup`, then upload the four CSVs from `data/` to the volume path it prints.
-3. Run `01` to `05` in order (serverless compute), or deploy the `fraud_initial_load` job.
-4. Run `06_process_new_batch` with `batch = next` three times (or schedule the `fraud_next_batch` job); each run picks the
-   next batch that has not arrived yet.
-5. Watch the experiment in the MLflow UI: `check_*`, `score_*` and `train_*` runs and the registered model versions.
-6. `99_reset` wipes tables, landing data and checkpoints (not the uploaded CSVs) for a clean start.
-
-**Jobs as code.** [`databricks.yml`](databricks.yml) defines both jobs (they run the notebooks from this Git branch):
+**Run it** (Databricks CLI, `-p` is your profile name from `databricks auth profiles`)
 ```bash
-databricks auth login --host <your workspace url>
-databricks bundle validate && databricks bundle deploy
+databricks bundle validate -p <profile> && databricks bundle deploy -p <profile>
+databricks bundle run fraud_reset -p <profile> --params delete_model=yes   # only if you have old tables/models
+databricks bundle run fraud_initial_load -p <profile>    # setup, simulate, pipeline (full refresh), train, score
+# upload the 4 CSVs to /Volumes/workspace/fraud/raw/source/ before simulate_arrivals runs, e.g.
+#   databricks fs cp data/train/client_train.csv dbfs:/Volumes/workspace/fraud/raw/source/ -p <profile>
+databricks bundle run fraud_next_batch -p <profile>      # x3: arrive, pipeline, check/retrain, score
 ```
-Ingestion uses Auto Loader (`settings.AUTOLOADER`); if you drop a bronze table, also delete its folder under
-`_checkpoints/` (or just run `99_reset`).
+The first `fraud_initial_load` fails at `simulate_arrivals` if the CSVs are not uploaded yet: upload them, run it again.
+`fraud_next_batch` has a daily schedule (paused). With nothing left to arrive it exits quietly.
 
 **Local check** (synthetic data, local Spark + MLflow, no Databricks needed):
 ```bash
