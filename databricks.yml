@@ -4,6 +4,10 @@
 bundle:
   name: fraud_detection
 
+variables:
+  schedule_status:  # PAUSED or UNPAUSED; switch on with: databricks bundle deploy --var schedule_status=UNPAUSED
+    default: PAUSED
+
 targets:
   dev:
     default: true
@@ -33,7 +37,7 @@ resources:
         - environment_key: ml
           spec:
             environment_version: "4"
-            dependencies: [xgboost, imbalanced-learn]
+            dependencies: [xgboost, imbalanced-learn, "mlflow>=3"]
       tasks:
         - task_key: setup
           environment_key: ml
@@ -59,14 +63,14 @@ resources:
     fraud_next_batch:  # each run: next batch arrives -> pipeline picks it up -> check/retrain -> score
       name: fraud_next_batch
       schedule:
-        quartz_cron_expression: "0 0 6 * * ?"
+        quartz_cron_expression: "0 0/15 * * * ?"  # every 15 minutes while testing; use "0 0 6 * * ?" for daily
         timezone_id: UTC
-        pause_status: PAUSED  # unpause in the UI when you want it to run daily
+        pause_status: ${var.schedule_status}
       environments:
         - environment_key: ml
           spec:
             environment_version: "4"
-            dependencies: [xgboost, imbalanced-learn]
+            dependencies: [xgboost, imbalanced-learn, "mlflow>=3"]
       tasks:
         - task_key: arrive
           environment_key: ml
@@ -93,10 +97,30 @@ resources:
         - environment_key: ml
           spec:
             environment_version: "4"
-            dependencies: [xgboost, imbalanced-learn]
+            dependencies: [xgboost, imbalanced-learn, "mlflow>=3"]
       tasks:
         - task_key: reset
           environment_key: ml
           spark_python_task:
             python_file: fraud_pipeline/reset.py
             parameters: ["--delete-model", "{{job.parameters.delete_model}}"]
+
+    fraud_full_demo:  # one click, from scratch: reset -> initial load -> the three arrival batches, one after another
+      name: fraud_full_demo
+      tasks:
+        - task_key: reset
+          run_job_task:
+            job_id: "${resources.jobs.fraud_reset.id}"
+            job_parameters: {delete_model: "yes"}
+        - task_key: initial_load
+          depends_on: [{task_key: reset}]
+          run_job_task: {job_id: "${resources.jobs.fraud_initial_load.id}"}
+        - task_key: batch_1
+          depends_on: [{task_key: initial_load}]
+          run_job_task: {job_id: "${resources.jobs.fraud_next_batch.id}"}
+        - task_key: batch_2
+          depends_on: [{task_key: batch_1}]
+          run_job_task: {job_id: "${resources.jobs.fraud_next_batch.id}"}
+        - task_key: batch_3
+          depends_on: [{task_key: batch_2}]
+          run_job_task: {job_id: "${resources.jobs.fraud_next_batch.id}"}

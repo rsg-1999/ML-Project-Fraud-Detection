@@ -96,6 +96,7 @@ def test_pipeline(env):
 
     preds = modeling.score_unlabeled()
     assert len(preds) == 2000 and preds.score.between(0, 1).all()
+    assert modeling.score_unlabeled() is None  # same champion version: nothing new to score
 
     assert lakehouse.next_unchecked() is None
     results = {}

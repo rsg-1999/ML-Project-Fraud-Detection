@@ -3,4 +3,5 @@ import modeling
 
 modeling.setup_mlflow()
 preds = modeling.score_unlabeled()
-print(f"scored {len(preds)} clients, flagged {preds.flag.mean():.1%}")
+if preds is not None:
+    print(f"scored {len(preds)} clients, flagged {preds.flag.mean():.1%}")

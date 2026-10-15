@@ -176,13 +176,18 @@ def load_champion():
 
 
 def score_unlabeled():
-    """Score gold_score with the champion; save predictions; log label-free monitoring metrics."""
+    """Score gold_score with the champion; save predictions; log label-free monitoring metrics.
+    Returns None without doing anything if this champion version has already scored the data."""
     mv, model, thr, base = load_champion()
+    sp, table = lakehouse.spark(), lakehouse.t("predictions")
+    if sp.catalog.tableExists(table) and sp.table(table).filter(F.col("model_version") == int(mv.version)).limit(1).count():
+        print(f"already scored with v{mv.version}, nothing to do")
+        return None
     X, _, ids = load(["score"], feed="score")
     p = model.predict_proba(X)[:, 1]
     out = pd.DataFrame({"client_id": ids, "score": p, "flag": p >= thr, "model_version": int(mv.version)})
     out["scored_at"] = pd.Timestamp.now()
-    lakehouse.spark().createDataFrame(out).write.mode("append").saveAsTable(lakehouse.t("predictions"))
+    sp.createDataFrame(out).write.mode("append").saveAsTable(table)
     with mlflow.start_run(run_name=f"score_v{mv.version}"):
         mlflow.set_tags({"run_type": "score", "model_version": mv.version})
         mlflow.log_metrics(monitor(X, p, thr, base))
